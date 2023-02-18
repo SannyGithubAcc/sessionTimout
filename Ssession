@@ -1,0 +1,70 @@
+public void ConfigureServices(IServiceCollection services)
+{
+    //...
+    services.AddSession(options =>
+    {
+        options.IdleTimeout = TimeSpan.FromMinutes(30);
+        options.Cookie.HttpOnly = true;
+        options.Cookie.IsEssential = true;
+    });
+    //...
+}
+
+public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+{
+    //...
+    app.UseSession();
+    //...
+}
+
+
+public class HomeController : Controller
+{
+    public IActionResult Index()
+    {
+        HttpContext.Session.SetString("SessionKeyName", "SessionValue");
+        return View();
+    }
+}
+
+public class SessionTimeoutMiddleware
+{
+    private readonly RequestDelegate _next;
+
+    public SessionTimeoutMiddleware(RequestDelegate next)
+    {
+        _next = next;
+    }
+
+    public async Task Invoke(HttpContext context)
+    {
+        var session = context.Session;
+        if (session != null)
+        {
+            var lastActivity = session.GetString("LastActivity");
+            if (!string.IsNullOrEmpty(lastActivity) && DateTime.TryParse(lastActivity, out DateTime lastActivityDate))
+            {
+                var now = DateTime.UtcNow;
+                var timeIdle = now - lastActivityDate;
+                if (timeIdle.TotalMinutes > session.IdleTimeout.TotalMinutes)
+                {
+                    await session.LoadAsync();
+                    session.Clear();
+                    session.CommitAsync();
+                    context.Response.Redirect("/Account/SessionTimeout");
+                    return;
+                }
+            }
+            session.SetString("LastActivity", DateTime.UtcNow.ToString());
+        }
+        await _next(context);
+    }
+}
+
+
+public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+{
+    //...
+    app.UseMiddleware<SessionTimeoutMiddleware>();
+    //...
+}
