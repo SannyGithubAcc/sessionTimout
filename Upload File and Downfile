@@ -1,0 +1,226 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Configuration;
+using System.Data.SqlClient;
+using System.Data;
+
+namespace YourNamespace.Controllers
+{
+    [ApiController]
+    [Route("[controller]")]
+    public class FileUploadController : ControllerBase
+    {
+        private readonly ILogger<FileUploadController> _logger;
+        private readonly IWebHostEnvironment _webHostEnvironment;
+        private readonly IConfiguration _config;
+
+        public FileUploadController(ILogger<FileUploadController> logger, IWebHostEnvironment webHostEnvironment, IConfiguration config)
+        {
+            _logger = logger;
+            _webHostEnvironment = webHostEnvironment;
+            _config = config;
+        }
+
+        [HttpPost, DisableRequestSizeLimit]
+        public async Task<IActionResult> UploadFiles()
+        {
+            try
+            {
+                var files = Request.Form.Files;
+                var allowedExtensions = new[] { ".pdf", ".png", ".jpg", ".jpeg", ".xls", ".xlsx" };
+                var uploads = Path.Combine(_webHostEnvironment.ContentRootPath, "uploads");
+
+                if (!Directory.Exists(uploads))
+                {
+                    Directory.CreateDirectory(uploads);
+                }
+
+                var localUploads = Path.Combine(_webHostEnvironment.ContentRootPath, "localUploads");
+
+                if (!Directory.Exists(localUploads))
+                {
+                    Directory.CreateDirectory(localUploads);
+                }
+
+                foreach (var file in files)
+                {
+                    var extension = Path.GetExtension(file.FileName).ToLower();
+                    if (!allowedExtensions.Contains(extension))
+                    {
+                        return BadRequest("File type not allowed. Only PDF, PNG, JPG, and Excel files are allowed.");
+                    }
+
+                    var fileName = Guid.NewGuid().ToString() + extension;
+                    var filePath = Path.Combine(uploads, fileName);
+                    var localFilePath = Path.Combine(localUploads, fileName);
+
+                    using (var stream = new FileStream(filePath, FileMode.Create))
+                    {
+                        await file.CopyToAsync(stream);
+                    }
+
+                    using (var localStream = new FileStream(localFilePath, FileMode.Create))
+                    {
+                        await file.CopyToAsync(localStream);
+                    }
+
+                    // Upload to FTP
+                    var ftpHost = _config["Ftp:Host"];
+                    var ftpUserName = _config["Ftp:UserName"];
+                    var ftpPassword = _config["Ftp:Password"];
+                    var ftpPath = _config["Ftp:Path"];
+
+                    using (var ftpClient = new WebClient())
+                    {
+                        ftpClient.Credentials = new NetworkCredential(ftpUserName, ftpPassword);
+                        ftpClient.UploadFile($"{ftpHost}/{ftpPath}/{fileName}", WebRequestMethods.Ftp.UploadFile, filePath);
+                    }
+
+                    // Upload to SQL Server
+                    var connectionString = _config.GetConnectionString("YourConnectionString");
+                    using (var connection = new SqlConnection(connectionString))
+                    {
+                        connection.Open();
+
+                        var command = connection.CreateCommand();
+                        command.CommandType = CommandType.Text;
+                        command.CommandText = "INSERT INTO YourTable (FileName, FileContent) VALUES (@FileName, @FileContent)";
+                        command.Parameters.AddWithValue("@FileName", fileName);
+
+                        byte[] fileContent = System.IO.File.ReadAllBytes(filePath);
+                        command.Parameters.AddWithValue("@FileContent", fileContent);
+
+                        command.ExecuteNonQuery();
+                    }
+                }
+
+                return Ok();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error uploading files");
+                return StatusCode(StatusCodes.Status500InternalServerError);
+            }
+        }
+    }
+}
+
+
+using System;
+using System.Data;
+using System.Data.SqlClient;
+using System.IO;
+using System.Linq;
+using System.Net;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+
+namespace YourNamespace.Controllers
+{
+    [ApiController]
+    [Route("[controller]")]
+    public class FileDownloadController : ControllerBase
+    {
+        private readonly ILogger<FileDownloadController> _logger;
+        private readonly IWebHostEnvironment _webHostEnvironment;
+        private readonly IConfiguration _config;
+
+        public FileDownloadController(ILogger<FileDownloadController> logger, IWebHostEnvironment webHostEnvironment, IConfiguration config)
+        {
+            _logger = logger;
+            _webHostEnvironment = webHostEnvironment;
+            _config = config;
+        }
+
+        [HttpGet]
+        public IActionResult DownloadFiles()
+        {
+            try
+            {
+                var downloads = Path.Combine(_webHostEnvironment.ContentRootPath, "downloads");
+                if (!Directory.Exists(downloads))
+                {
+                    Directory.CreateDirectory(downloads);
+                }
+
+                // Download from FTP
+                var ftpHost = _config["Ftp:Host"];
+                var ftpUserName = _config["Ftp:UserName"];
+                var ftpPassword = _config["Ftp:Password"];
+                var ftpPath = _config["Ftp:Path"];
+
+                using (var ftpClient = new WebClient())
+                {
+                    ftpClient.Credentials = new NetworkCredential(ftpUserName, ftpPassword);
+
+                    var files = ftpClient.DownloadString($"{ftpHost}/{ftpPath}").Split("\n");
+
+                    foreach (var file in files)
+                    {
+                        if (string.IsNullOrEmpty(file)) continue;
+
+                        var fileName = file.Trim();
+
+                        using (var stream = new FileStream(Path.Combine(downloads, fileName), FileMode.Create))
+                        {
+                            ftpClient.DownloadFile($"{ftpHost}/{ftpPath}/{fileName}", stream);
+                        }
+                    }
+                }
+
+                // Download from SQL Server
+                var connectionString = _config.GetConnectionString("YourConnectionString");
+                using (var connection = new SqlConnection(connectionString))
+                {
+                    connection.Open();
+
+                    var command = connection.CreateCommand();
+                    command.CommandType = CommandType.Text;
+                    command.CommandText = "SELECT FileName, FileContent FROM YourTable";
+
+                    var reader = command.ExecuteReader();
+
+                    while (reader.Read())
+                    {
+                        var fileName = reader.GetString(0);
+                        var fileContent = (byte[])reader.GetValue(1);
+
+                        using (var stream = new FileStream(Path.Combine(downloads, fileName), FileMode.Create))
+                        {
+                            stream.Write(fileContent, 0, fileContent.Length);
+                        }
+                    }
+                }
+
+                // Copy from local drive
+                var localUploads = Path.Combine(_webHostEnvironment.ContentRootPath, "localUploads");
+                var filesToCopy = Directory.GetFiles(localUploads);
+
+                foreach (var file in filesToCopy)
+                {
+                    var fileName = Path.GetFileName(file);
+                    System.IO.File.Copy(file, Path.Combine(downloads, fileName));
+                }
+
+                var zipFile = Path.Combine(downloads, "files.zip");
+                ZipFile.CreateFromDirectory(downloads, zipFile);
+
+                return File(System.IO.File.ReadAllBytes(zipFile), "application/zip", "files.zip");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error downloading files");
+                return StatusCode(500, "An error occurred while downloading files");
+            }
+        }
+    }
+}
+
